@@ -11,8 +11,9 @@ Bidirectional blocking ping-pong MCP server for live discussions between **Antig
 - **Single-call Send + Wait (`peer_exchange`)**: Delivers a proposal or critique to the peer agent, unlocks their pending wait call, and blocks until the peer replies.
 - **Heartbeat Renewal (`peer_wait`)**: Waits in 45-second cycles and returns `status: "waiting_heartbeat"` when the peer is running long benchmarks or reading code, preventing MCP request timeouts.
 - **Automatic Consensus (`stance: "agreed"`)**: When an agent agrees 100% with the peer's latest version with zero changes, both sides unlock with `status: "converged"` and present the final plan to the user.
+- **Standby Background Listeners (`peer_wait(standby: true)`)**: After consensus (`status: "converged"`), both agents can spawn a lightweight background listener subagent calling `peer_wait(standby: true, timeout_sec: 120)` so their main chat turns stay free for user conversation while automatically waking up as soon as the peer starts the next topic.
 - **Pause & Intervene Safety**: If you pause one agent to give private instructions in chat while the other agent sends a message, the unread message is preserved in the inbox and delivered before the next outgoing send.
-- **Wrong-Turn & Mutual-Wait Deadlock Protection**: Immediately rejects `peer_wait` with `status: "your_turn_to_reply"` when an agent already received the peer's latest message and owes a reply, or `status: "mutual_wait_prevented"` when the peer is already listening on an idle/converged room.
+- **Wrong-Turn & Mutual-Wait Deadlock Protection**: Immediately rejects `peer_wait` with `status: "your_turn_to_reply"` when an agent already received the peer's latest message and owes a reply, or `status: "mutual_wait_prevented"` when both main agents try to block in foreground `peer_wait` on an idle room with no message in flight.
 - **Zero Dependencies**: Pure Node.js (`server.cjs`, `setup.cjs`).
 
 ## Installation
@@ -39,7 +40,7 @@ node server.cjs --reset
 
 1. `peer_exchange(message, stance, topic?, new_session?, wait_for_reply?, timeout_sec?)`
    - `stance`: `"propose"` | `"critique"` | `"agreed"`
-2. `peer_wait(timeout_sec?)`
+2. `peer_wait(timeout_sec?, standby?)`
 3. `peer_status(action?: "status" | "reset")`
 
 ## Typical Workflow

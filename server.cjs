@@ -117,6 +117,11 @@ function isTransientFsError(err) {
 }
 
 let tmpWriteCounter = 0;
+let waitTokenCounter = 0;
+
+function nextWaitToken() {
+  return `${process.pid}:${Date.now()}:${++waitTokenCounter}`;
+}
 
 function acquireLockSync(lockFile) {
   ensureDirs();
@@ -222,17 +227,33 @@ function writeJsonAtomic(filePath, obj) {
   }
 }
 
-function setPresence(state, role, nextState, detail, nowMs = Date.now(), preserveSince = false) {
+function setPresence(
+  state,
+  role,
+  nextState,
+  detail,
+  nowMs = Date.now(),
+  preserveSince = false,
+  waitToken = undefined,
+  standby = undefined
+) {
   if (role === detectedSelfRole) {
     hasActivePresence = nextState !== 'idle';
   }
   const prevSince = state.presence[role]?.sinceMs;
-  state.presence[role] = {
+  const entry = {
     state: nextState,
     sinceMs: preserveSince && prevSince ? prevSince : nowMs,
     updatedMs: nowMs,
     detail,
   };
+  if (nextState === 'waiting' && waitToken) {
+    entry.waitToken = waitToken;
+  }
+  if (nextState === 'waiting' && standby) {
+    entry.standby = true;
+  }
+  state.presence[role] = entry;
 }
 
 function waitingDetail(peerRole, sentSeq) {
@@ -241,11 +262,24 @@ function waitingDetail(peerRole, sentSeq) {
     : `Listening for ${peerRole}`;
 }
 
-function isFreshWaitingPresence(p, detail, nowMs, maxAgeMs = HEARTBEAT_UPDATE_MS) {
+function isFreshWaitingPresence(
+  p,
+  detail,
+  nowMs,
+  maxAgeMs = HEARTBEAT_UPDATE_MS,
+  standby = false
+) {
   return Boolean(
-    p && p.state === 'waiting' && p.detail === detail && nowMs - (p.updatedMs || 0) < maxAgeMs
+    p &&
+      p.state === 'waiting' &&
+      p.detail === detail &&
+      Boolean(p.standby) === Boolean(standby) &&
+      nowMs - (p.updatedMs || 0) < maxAgeMs
   );
 }
+
+const STANDBY_LISTENER_HINT =
+  'To stay connected for the next bridge topic while keeping your main chat turn free to talk with the user, spawn a background listener subagent calling peer_wait(standby=true) before ending your turn.';
 
 function buildConvergedPayload(state, selfRole, peerRole, seq, instruction) {
   return {
@@ -261,11 +295,14 @@ function buildConvergedPayload(state, selfRole, peerRole, seq, instruction) {
   };
 }
 
-function checkMutualWaitGuard(state, selfRole, peerRole, sentSeq, nowMs) {
+function checkMutualWaitGuard(state, selfRole, peerRole, sentSeq, nowMs, standby = false) {
   const peerPres = state.presence[peerRole];
   if (
     sentSeq ||
     state.status === 'active' ||
+    state.status === 'converged' ||
+    standby ||
+    peerPres?.standby ||
     peerPres?.state !== 'waiting' ||
     nowMs - (peerPres.updatedMs || 0) >= HEARTBEAT_UPDATE_MS * 3
   ) {
@@ -287,8 +324,8 @@ function checkMutualWaitGuard(state, selfRole, peerRole, sentSeq, nowMs) {
       peer_presence: peerSummary,
       instruction:
         `DEADLOCK PREVENTED: ${peerRole} is ALREADY waiting and listening for you (${peerSummary}). ` +
-        `Both agents cannot call peer_wait() at the same time when no message is in flight. ` +
-        `Do NOT call peer_wait() again. Either send the next message/proposal via peer_exchange() when your work/subagents finish, or ask the user which agent should propose first.`,
+        `Both main agents cannot block in foreground peer_wait() at the same time on an idle room when no message is in flight. ` +
+        `Do NOT call foreground peer_wait() again (use standby=true only from a background listener subagent). Either send the next message/proposal via peer_exchange() when your work finishes, or ask the user which agent should propose first.`,
     },
   };
 }
@@ -361,7 +398,8 @@ function resetRoomStateInPlace(state, room) {
         p,
         waitingDetail(oppositeRole(role), null),
         fresh.updatedMs,
-        HEARTBEAT_UPDATE_MS * 3
+        HEARTBEAT_UPDATE_MS * 3,
+        Boolean(p?.standby)
       )
     ) {
       fresh.presence[role] = p;
@@ -448,13 +486,13 @@ function consumeUnreadPeerMessages(state, selfRole, eventType = 'message_receive
       `Your outgoing message was NOT sent yet so you do not talk past each other. ` +
       `1) Summarize ${peerRole}'s message for the user in your chat. ` +
       (isConverged
-        ? `2) If you also agree 100% with zero further changes, stop calling bridge tools and present the final plan; otherwise call peer_exchange again to send your response.`
+        ? `2) If you also agree 100% with zero further changes, present the final plan to the user (${STANDBY_LISTENER_HINT}); otherwise call peer_exchange again to send your response.`
         : `2) Reconcile their points with your analysis and any user instructions. ` +
           `3) Call peer_exchange again to send your unified response.`);
   } else if (isConverged) {
     instruction =
       `CONSENSUS REACHED: Both ${selfRole} and ${peerRole} have converged on the plan (stance: "agreed"). ` +
-      `Stop calling peer_exchange/peer_wait and present the final unified plan clearly to the user.`;
+      `Present the final unified plan clearly to the user. ${STANDBY_LISTENER_HINT}`;
   } else {
     instruction =
       `Received reply #${latestSeq} from ${peerRole} (stance: "${latest.stance}"). ` +
@@ -533,6 +571,8 @@ async function waitForPeerTurn({
   lastHeartbeatMs,
   peerPresence,
   note,
+  waitToken,
+  standby,
 }) {
   const clampedSec = normalizeTimeoutSec(timeoutSec);
   const deadlineMs = Date.now() + clampedSec * 1000;
@@ -612,7 +652,7 @@ async function waitForPeerTurn({
           }
 
           if (changed) {
-            if (sentSeq || hadActiveSession) {
+            if ((sentSeq || hadActiveSession) && state.seq === 0) {
               setPresence(state, selfRole, 'idle', 'Room reset while waiting', nowMs);
               return {
                 payload: {
@@ -630,7 +670,33 @@ async function waitForPeerTurn({
             currentSessionId = state.sessionId;
           }
 
-          const mutualGuard = checkMutualWaitGuard(state, selfRole, peerRole, sentSeq, nowMs);
+          const selfPres = state.presence[selfRole];
+          if (
+            waitToken &&
+            selfPres?.waitToken !== waitToken &&
+            (selfPres?.state !== 'waiting' || selfPres?.waitToken != null)
+          ) {
+            return {
+              skipWrite: true,
+              payload: {
+                status: 'cancelled',
+                room: state.room,
+                self: selfRole,
+                peer: peerRole,
+                reason: 'superseded',
+                instruction: 'Wait was cancelled or superseded by a newer request.',
+              },
+            };
+          }
+
+          const mutualGuard = checkMutualWaitGuard(
+            state,
+            selfRole,
+            peerRole,
+            sentSeq,
+            nowMs,
+            standby
+          );
           if (mutualGuard) {
             return mutualGuard;
           }
@@ -643,7 +709,9 @@ async function waitForPeerTurn({
               'waiting',
               waitingDetail(peerRole, sentSeq),
               nowMs,
-              true
+              true,
+              waitToken,
+              standby
             );
             return {};
           }
@@ -707,12 +775,13 @@ async function waitForPeerTurn({
     peer: peerRole,
     waited_sec: clampedSec,
     sent_seq: sentSeq || undefined,
+    standby: standby || undefined,
     note: note || undefined,
     peer_presence: peerPresSummary,
     instruction:
       `${peerRole} has not replied yet after ${clampedSec}s (${peerPresSummary}). ` +
       `They may still be running benchmarks, reading files, or waiting for user input. ` +
-      `Call peer_wait() immediately without stopping your turn so you receive their reply as soon as they finish.`,
+      `Call ${standby ? 'peer_wait(standby=true)' : 'peer_wait()'} immediately without stopping your turn so you receive their reply as soon as they finish.`,
   };
 }
 
@@ -758,7 +827,7 @@ async function handlePeerExchange(args = {}, requestId) {
             peerRole,
             state.seq,
             `CONSENSUS ALREADY REACHED at #${state.seq}: Both ${selfRole} and ${peerRole} have converged on the plan. ` +
-              `Stop calling bridge tools and present the final agreed plan to the user.`
+              `Present the final agreed plan to the user. ${STANDBY_LISTENER_HINT}`
           ),
         };
       }
@@ -811,18 +880,22 @@ async function handlePeerExchange(args = {}, requestId) {
           peerRole,
           nextSeq,
           `CONSENSUS REACHED: You (${selfRole}) agreed with ${peerRole}'s latest proposal (#${nextSeq}). ` +
-            `${peerRole} has been notified and unlocked. Stop calling bridge tools and present the final agreed plan to the user.`
+            `${peerRole} has been notified and unlocked. Present the final agreed plan to the user. ${STANDBY_LISTENER_HINT}`
         ),
       };
     }
 
     state.status = 'active';
+    const waitToken = waitForReply ? nextWaitToken() : null;
     setPresence(
       state,
       selfRole,
       waitForReply ? 'waiting' : 'idle',
       waitForReply ? waitingDetail(peerRole, nextSeq) : `Sent #${nextSeq} (${effectiveStance})`,
-      nowMs
+      nowMs,
+      false,
+      waitToken,
+      false
     );
 
     if (!waitForReply) {
@@ -848,6 +921,8 @@ async function handlePeerExchange(args = {}, requestId) {
       lastHeartbeatMs: nowMs,
       peerPresence: state.presence[peerRole],
       note,
+      waitToken,
+      standby: false,
     };
   });
 
@@ -868,6 +943,7 @@ async function handlePeerExchange(args = {}, requestId) {
 async function handlePeerWait(args = {}, requestId) {
   const { selfRole, peerRole, room } = resolveContext(args);
   const timeoutSec = normalizeTimeoutSec(args.timeout_sec);
+  const standby = Boolean(args.standby);
 
   cancelActiveWait(room, selfRole);
 
@@ -903,7 +979,7 @@ async function handlePeerWait(args = {}, requestId) {
 
     const sentSeq =
       state.status === 'active' && lastMsg && lastMsg.from === selfRole ? lastMsg.seq : null;
-    const mutualGuard = checkMutualWaitGuard(state, selfRole, peerRole, sentSeq, nowMs);
+    const mutualGuard = checkMutualWaitGuard(state, selfRole, peerRole, sentSeq, nowMs, standby);
     if (mutualGuard) {
       return mutualGuard;
     }
@@ -911,10 +987,27 @@ async function handlePeerWait(args = {}, requestId) {
     const desiredDetail = waitingDetail(peerRole, sentSeq);
 
     const prevPres = state.presence[selfRole];
-    const alreadyWaitingFresh = isFreshWaitingPresence(prevPres, desiredDetail, nowMs);
+    const alreadyWaitingFresh = isFreshWaitingPresence(
+      prevPres,
+      desiredDetail,
+      nowMs,
+      HEARTBEAT_UPDATE_MS,
+      standby
+    );
+    const waitToken =
+      alreadyWaitingFresh && prevPres?.waitToken ? prevPres.waitToken : nextWaitToken();
 
     if (!alreadyWaitingFresh) {
-      setPresence(state, selfRole, 'waiting', desiredDetail, nowMs, prevPres?.state === 'waiting');
+      setPresence(
+        state,
+        selfRole,
+        'waiting',
+        desiredDetail,
+        nowMs,
+        prevPres?.state === 'waiting',
+        waitToken,
+        standby
+      );
     }
     return {
       skipWrite: alreadyWaitingFresh,
@@ -923,6 +1016,8 @@ async function handlePeerWait(args = {}, requestId) {
       hadActiveSession: state.status === 'active',
       lastHeartbeatMs: alreadyWaitingFresh ? prevPres.updatedMs : nowMs,
       peerPresence: state.presence[peerRole],
+      waitToken,
+      standby,
     };
   });
 
@@ -988,7 +1083,8 @@ const MCP_TOOLS = [
       '3. Address points explicitly (e.g. "Point 1: Agree. Point 2: Disagree because...").\n' +
       '4. Set stance="propose" for an initial plan or major revision; stance="critique" whenever you have ANY objection, counter-proposal, or improvement; stance="agreed" ONLY when you have zero remaining objections or improvements to the peer\'s latest plan.\n' +
       '5. If peer_exchange returns status="waiting_heartbeat" (because the peer is running long measurements), immediately call peer_wait() to keep waiting.\n' +
-      '6. NEVER call peer_exchange(wait_for_reply=true) or peer_wait() while you have a background subagent or background task running, because blocking in a bridge tool prevents your own subagents from waking you up.',
+      '6. In your main agent turn, NEVER call peer_exchange(wait_for_reply=true) or foreground peer_wait() while you have a work subagent or background task running, because blocking in a foreground bridge tool prevents your own subagents from waking you up.\n' +
+      '7. Standby Background Listener: Whenever a session reaches status="converged" (or between sessions when you want to stay connected on the bridge while keeping your main chat turn free to talk with the user), spawn a dedicated background listener subagent that calls peer_wait(standby=true) in a loop and wakes you up as soon as a peer message arrives.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1031,10 +1127,10 @@ const MCP_TOOLS = [
     description:
       'Listen and wait for the next message from the peer agent (claude or antigravity).\n\n' +
       'When to use:\n' +
-      '1. When the user tells you to listen on the bridge / wait for the other agent to send a plan.\n' +
-      '2. Immediately after peer_exchange or peer_wait returns status="waiting_heartbeat" (meaning the peer is still analyzing code or running measurements).\n\n' +
+      '1. Foreground wait: When the user tells you to listen on the bridge / wait for the other agent to send a plan, or immediately after peer_exchange / peer_wait returns status="waiting_heartbeat".\n' +
+      '2. Standby background listener (standby=true): Spawn a dedicated background subagent (e.g. a subagent with MCP access in Antigravity or Agent with run_in_background=true in Claude Code) that calls peer_wait(standby=true, timeout_sec=120) in a loop on waiting_heartbeat and returns immediately on message_received or converged. This keeps your main chat turn free to talk with the user while automatically waking you up when the peer speaks.\n\n' +
       'When NOT to use:\n' +
-      '- NEVER call peer_wait while you have a background subagent or background task running (blocking in peer_wait prevents your own subagents from waking you up).\n' +
+      '- In your main agent turn, NEVER call foreground peer_wait while you have a work subagent or background task running.\n' +
       '- NEVER call peer_wait when you already received the peer\'s latest message and it is YOUR turn to reply (finish your work/subagents first, then call peer_exchange).\n' +
       '- NEVER call peer_wait if peer_wait returns status="your_turn_to_reply" or status="mutual_wait_prevented".\n\n' +
       'When a message arrives: summarize the peer\'s points for the user in your chat window, perform any needed checks/measurements, and reply with peer_exchange (unless status="converged").',
@@ -1045,6 +1141,11 @@ const MCP_TOOLS = [
           type: 'number',
           description:
             'Seconds to wait before returning a waiting_heartbeat reminder (default: 45, max: 120).',
+        },
+        standby: {
+          type: 'boolean',
+          description:
+            'Set to true when called from a background listener subagent so both agents can stay on standby between sessions without triggering mutual_wait_prevented.',
         },
       },
     },
@@ -1473,6 +1574,58 @@ async function runSelfTest() {
       { mtimeBefore, mtimeAfter, mutualWait }
     );
 
+    // 6b. Dual standby background listeners + cross-process waitToken supersede without clobbering presence
+    const claudeStandby = handlePeerWait({
+      room: testRoom,
+      agent: 'claude',
+      timeout_sec: 10,
+      standby: true,
+    });
+    const agyStandby = handlePeerWait({
+      room: testRoom,
+      agent: 'antigravity',
+      timeout_sec: 10,
+      standby: true,
+    });
+    const newCallerToken = nextWaitToken();
+    mutateRoomSync(testRoom, (s) => {
+      resetRoomStateInPlace(s, testRoom);
+      const nowMs = Date.now();
+      s.status = 'active';
+      s.seq = 1;
+      s.messages.push({
+        seq: 1,
+        from: 'claude',
+        to: 'antigravity',
+        stance: 'propose',
+        content: 'Cross-process topic (#1)',
+        timestamp: new Date(nowMs).toISOString(),
+      });
+      s.cursors.claude = 1;
+      setPresence(
+        s,
+        'claude',
+        'waiting',
+        waitingDetail('antigravity', 1),
+        nowMs,
+        false,
+        newCallerToken,
+        false
+      );
+      return {};
+    });
+    const [claudeSup, agyWoken] = await Promise.all([claudeStandby, agyStandby]);
+    const postStandbyState = readRoomStateRawSync(stateFile, testRoom);
+    check(
+      claudeSup.status === 'cancelled' &&
+        claudeSup.reason === 'superseded' &&
+        agyWoken.status === 'message_received' &&
+        agyWoken.peer_message?.seq === 1 &&
+        postStandbyState.presence.claude?.waitToken === newCallerToken,
+      'StandbyAndCrossProcessSupersede',
+      { claudeSup, agyWoken, claudePres: postStandbyState.presence.claude }
+    );
+
     // 7. Corrupt JSON backup (moved once, not duplicated on subsequent status reads) & recovery
     fs.writeFileSync(stateFile, '{corrupt json', 'utf-8');
     const rec = handlePeerStatus({ room: testRoom, action: 'status' });
@@ -1500,6 +1653,7 @@ async function runSelfTest() {
           cancel_safety_verified: true,
           no_op_wait_zero_writes_verified: true,
           wrong_turn_and_mutual_wait_guards_verified: true,
+          standby_and_cross_process_supersede_verified: true,
           corrupt_recovery_verified: true,
         },
         null,
