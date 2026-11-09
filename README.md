@@ -12,6 +12,7 @@ Bidirectional blocking ping-pong MCP server for live discussions between **Antig
 - **Heartbeat Renewal (`peer_wait`)**: Waits in 45-second cycles and returns `status: "waiting_heartbeat"` when the peer is running long benchmarks or reading code, preventing MCP request timeouts.
 - **Automatic Consensus (`stance: "agreed"`)**: When an agent agrees 100% with the peer's latest version with zero changes, both sides unlock with `status: "converged"` and present the final plan to the user.
 - **Pause & Intervene Safety**: If you pause one agent to give private instructions in chat while the other agent sends a message, the unread message is preserved in the inbox and delivered before the next outgoing send.
+- **Wrong-Turn & Mutual-Wait Deadlock Protection**: Immediately rejects `peer_wait` with `status: "your_turn_to_reply"` when an agent already received the peer's latest message and owes a reply, or `status: "mutual_wait_prevented"` when the peer is already listening on an idle/converged room.
 - **Zero Dependencies**: Pure Node.js (`server.cjs`, `setup.cjs`).
 
 ## Installation
@@ -21,8 +22,18 @@ Run the installer to register `agent-bridge` in both `~/.gemini/config/mcp_confi
 ```bash
 node setup.cjs
 node setup.cjs --check
+node setup.cjs --uninstall
 node server.cjs --selftest
+node server.cjs --status
+node server.cjs --reset
 ```
+
+## Environment Variables
+
+- `AGENT_BRIDGE_DATA_DIR`: Override the room state directory (default: `./data`).
+- `AGENT_BRIDGE_ROLE`: Default agent identity (`antigravity` | `claude`).
+- `ANTIGRAVITY_CONFIG_DIR`: Override `~/.gemini/config` path in `setup.cjs`.
+- `CLAUDE_CONFIG_FILE`: Override `~/.claude.json` path in `setup.cjs`.
 
 ## MCP Tools
 

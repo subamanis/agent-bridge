@@ -20,18 +20,19 @@ const DATA_DIR = process.env.AGENT_BRIDGE_DATA_DIR
   : path.join(__dirname, 'data');
 const ARCHIVE_DIR = path.join(DATA_DIR, 'archive');
 
+let dirsEnsured = false;
 function ensureDirs() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (!fs.existsSync(ARCHIVE_DIR)) {
+  if (!dirsEnsured) {
     fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+    dirsEnsured = true;
   }
 }
 
 function sanitizeRoomName(room) {
-  const raw = String(room || DEFAULT_ROOM).trim().toLowerCase();
-  const cleaned = raw.replace(/[^a-z0-9_-]/g, '');
+  const cleaned = String(room || DEFAULT_ROOM)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, '');
   return cleaned || DEFAULT_ROOM;
 }
 
@@ -42,7 +43,6 @@ function normalizeAgentRole(val) {
   if (s.includes('antigravity') || s.includes('agy') || s.includes('gemini')) {
     return 'antigravity';
   }
-  if (s === 'claude' || s === 'antigravity') return s;
   return null;
 }
 
@@ -55,60 +55,46 @@ function parseCliArgs(argv) {
     agent: normalizeAgentRole(process.env.AGENT_BRIDGE_ROLE),
     room: DEFAULT_ROOM,
     cliMode: null,
-    message: null,
-    stance: 'propose',
-    topic: null,
-    newSession: false,
-    waitForReply: true,
-    timeoutSec: DEFAULT_WAIT_SEC,
   };
 
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--agent' && argv[i + 1]) {
-      opts.agent = normalizeAgentRole(argv[++i]) || opts.agent;
-    } else if (arg.startsWith('--agent=')) {
-      opts.agent = normalizeAgentRole(arg.slice('--agent='.length)) || opts.agent;
-    } else if (arg === '--room' && argv[i + 1]) {
-      opts.room = sanitizeRoomName(argv[++i]);
-    } else if (arg.startsWith('--room=')) {
-      opts.room = sanitizeRoomName(arg.slice('--room='.length));
-    } else if (arg === '--status') {
-      opts.cliMode = 'status';
-    } else if (arg === '--reset') {
-      opts.cliMode = 'reset';
-    } else if (arg === '--wait') {
-      opts.cliMode = 'wait';
-    } else if (arg === '--send' && argv[i + 1]) {
-      opts.cliMode = 'send';
-      opts.message = argv[++i];
-    } else if (arg === '--stance' && argv[i + 1]) {
-      opts.stance = argv[++i];
-    } else if (arg === '--topic' && argv[i + 1]) {
-      opts.topic = argv[++i];
-    } else if (arg === '--new-session') {
-      opts.newSession = true;
-    } else if (arg === '--no-wait') {
-      opts.waitForReply = false;
-    } else if (arg === '--timeout' && argv[i + 1]) {
-      opts.timeoutSec = Number(argv[++i]) || DEFAULT_WAIT_SEC;
-    } else if (arg === '--selftest') {
-      opts.cliMode = 'selftest';
+    if (arg === '--agent' || arg.startsWith('--agent=')) {
+      const val = arg === '--agent' ? argv[++i] : arg.slice('--agent='.length);
+      const role = val && !val.startsWith('-') ? normalizeAgentRole(val) : null;
+      if (!role) throw new Error(`Invalid --agent value: ${val ?? ''}`);
+      opts.agent = role;
+    } else if (arg === '--room' || arg.startsWith('--room=')) {
+      const val = arg === '--room' ? argv[++i] : arg.slice('--room='.length);
+      if (!val || val.startsWith('-')) throw new Error(`Invalid --room value: ${val ?? ''}`);
+      opts.room = sanitizeRoomName(val);
+    } else if (arg === '--status' || arg === '--reset' || arg === '--selftest') {
+      opts.cliMode = arg.slice(2);
     } else if (arg === '--help' || arg === '-h') {
       opts.cliMode = 'help';
+    } else {
+      throw new Error(`Unknown argument: ${arg}. Run "node server.cjs --help" for usage.`);
     }
   }
   return opts;
 }
 
-const cliOpts = parseCliArgs(process.argv);
+const cliOpts = parseCliArgs(require.main === module ? process.argv : []);
 let detectedSelfRole = cliOpts.agent;
+let hasActivePresence = false;
 
-function getSelfRole(explicitAgent) {
-  const fromArg = normalizeAgentRole(explicitAgent);
-  if (fromArg) return fromArg;
-  if (detectedSelfRole) return detectedSelfRole;
-  return 'antigravity';
+function resolveContext(args = {}) {
+  const selfRole = normalizeAgentRole(args.agent) || (detectedSelfRole ||= 'antigravity');
+  return {
+    selfRole,
+    peerRole: oppositeRole(selfRole),
+    room: sanitizeRoomName(args.room || cliOpts.room),
+  };
+}
+
+function normalizeTimeoutSec(val) {
+  if (typeof val !== 'number' || !Number.isFinite(val)) return DEFAULT_WAIT_SEC;
+  return Math.min(MAX_WAIT_SEC, Math.max(1, Math.round(val)));
 }
 
 function getRoomPaths(roomName) {
@@ -120,69 +106,207 @@ function getRoomPaths(roomName) {
   };
 }
 
-function sleepMs(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+const SLEEP_VIEW = new Int32Array(new SharedArrayBuffer(4));
+function sleepSync(ms) {
+  Atomics.wait(SLEEP_VIEW, 0, 0, ms);
 }
+
+function isTransientFsError(err) {
+  const code = err && err.code;
+  return code === 'EPERM' || code === 'EACCES' || code === 'EBUSY';
+}
+
+let tmpWriteCounter = 0;
 
 function acquireLockSync(lockFile) {
   ensureDirs();
+  const token = `${process.pid}:${++tmpWriteCounter}`;
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
     try {
-      const fd = fs.openSync(lockFile, 'wx');
-      fs.writeSync(fd, String(process.pid));
-      fs.closeSync(fd);
-      return true;
+      fs.writeFileSync(lockFile, token, { flag: 'wx' });
+      return token;
     } catch (err) {
-      if (err && err.code === 'EEXIST') {
+      if (err.code === 'EEXIST' || isTransientFsError(err)) {
         try {
-          const stat = fs.statSync(lockFile);
-          if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
-            fs.unlinkSync(lockFile);
+          if (Date.now() - fs.statSync(lockFile).mtimeMs > LOCK_STALE_MS) {
+            const staleTmp = `${lockFile}.stale.${process.pid}.${++tmpWriteCounter}`;
+            try {
+              fs.renameSync(lockFile, staleTmp);
+              fs.unlinkSync(staleTmp);
+            } catch {
+              try {
+                fs.unlinkSync(lockFile);
+              } catch {}
+            }
             continue;
           }
-        } catch {}
-        const waitUntil = Date.now() + 15;
-        while (Date.now() < waitUntil) {
-          // short spin under contention
+        } catch (statErr) {
+          if (statErr.code === 'ENOENT') continue;
         }
+        sleepSync(15);
         continue;
       }
       throw err;
     }
   }
   try {
-    fs.unlinkSync(lockFile);
+    fs.writeFileSync(lockFile, token, { flag: 'w' });
   } catch {}
-  const fd = fs.openSync(lockFile, 'wx');
-  fs.writeSync(fd, String(process.pid));
-  fs.closeSync(fd);
-  return true;
+  return token;
 }
 
-function releaseLockSync(lockFile) {
+function releaseLockSync(lockFile, token) {
   try {
-    fs.unlinkSync(lockFile);
+    if (fs.readFileSync(lockFile, 'utf-8') === token) {
+      fs.unlinkSync(lockFile);
+    }
   } catch {}
 }
 
-function createFreshRoomState(roomName, topic) {
-  const nowIso = new Date().toISOString();
-  const nowMs = Date.now();
+function readJsonSafe(filePath) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const raw = fs.readFileSync(filePath, 'utf-8');
+      const text = (raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw).trim();
+      if (!text) return {};
+      const parsed = JSON.parse(text);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch (err) {
+      if (err.code === 'ENOENT') return {};
+      if ((isTransientFsError(err) || err instanceof SyntaxError) && attempt < 4) {
+        sleepSync(12 * (attempt + 1));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+function writeJsonAtomic(filePath, obj) {
+  const dir = path.dirname(filePath);
+  if (dir === DATA_DIR) {
+    ensureDirs();
+  } else {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  const tmpFile = `${filePath}.tmp.${process.pid}.${++tmpWriteCounter}`;
+  let renamed = false;
+  try {
+    fs.writeFileSync(tmpFile, JSON.stringify(obj, null, 2) + '\n', 'utf-8');
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        fs.renameSync(tmpFile, filePath);
+        renamed = true;
+        return;
+      } catch (err) {
+        if (isTransientFsError(err)) {
+          if (attempt < 5) {
+            sleepSync(12 * (attempt + 1));
+            continue;
+          }
+          if (process.platform === 'win32') {
+            fs.copyFileSync(tmpFile, filePath);
+            return;
+          }
+        }
+        throw err;
+      }
+    }
+  } finally {
+    if (!renamed) {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+    }
+  }
+}
+
+function setPresence(state, role, nextState, detail, nowMs = Date.now(), preserveSince = false) {
+  if (role === detectedSelfRole) {
+    hasActivePresence = nextState !== 'idle';
+  }
+  const prevSince = state.presence[role]?.sinceMs;
+  state.presence[role] = {
+    state: nextState,
+    sinceMs: preserveSince && prevSince ? prevSince : nowMs,
+    updatedMs: nowMs,
+    detail,
+  };
+}
+
+function waitingDetail(peerRole, sentSeq) {
+  return sentSeq
+    ? `Waiting for ${peerRole}'s reply to #${sentSeq}`
+    : `Listening for ${peerRole}`;
+}
+
+function isFreshWaitingPresence(p, detail, nowMs, maxAgeMs = HEARTBEAT_UPDATE_MS) {
+  return Boolean(
+    p && p.state === 'waiting' && p.detail === detail && nowMs - (p.updatedMs || 0) < maxAgeMs
+  );
+}
+
+function buildConvergedPayload(state, selfRole, peerRole, seq, instruction) {
   return {
-    room: sanitizeRoomName(roomName),
+    status: 'converged',
+    room: state.room,
+    session_id: state.sessionId,
+    topic: state.topic || '(untitled)',
+    self: selfRole,
+    peer: peerRole,
+    sent_seq: seq,
+    stance: 'agreed',
+    instruction,
+  };
+}
+
+function checkMutualWaitGuard(state, selfRole, peerRole, sentSeq, nowMs) {
+  const peerPres = state.presence[peerRole];
+  if (
+    sentSeq ||
+    state.status === 'active' ||
+    peerPres?.state !== 'waiting' ||
+    nowMs - (peerPres.updatedMs || 0) >= HEARTBEAT_UPDATE_MS * 3
+  ) {
+    return null;
+  }
+  const wasWaiting = state.presence[selfRole]?.state === 'waiting';
+  if (wasWaiting) {
+    setPresence(state, selfRole, 'idle', 'Idle', nowMs);
+  }
+  const peerSummary = formatPresenceSummary(peerPres);
+  return {
+    skipWrite: !wasWaiting,
+    payload: {
+      status: 'mutual_wait_prevented',
+      room: state.room,
+      session_id: state.sessionId,
+      self: selfRole,
+      peer: peerRole,
+      peer_presence: peerSummary,
+      instruction:
+        `DEADLOCK PREVENTED: ${peerRole} is ALREADY waiting and listening for you (${peerSummary}). ` +
+        `Both agents cannot call peer_wait() at the same time when no message is in flight. ` +
+        `Do NOT call peer_wait() again. Either send the next message/proposal via peer_exchange() when your work/subagents finish, or ask the user which agent should propose first.`,
+    },
+  };
+}
+
+function createFreshRoomState(room) {
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  return {
+    room,
     sessionId: `sess-${nowMs}-${crypto.randomBytes(3).toString('hex')}`,
-    topic: topic ? String(topic).trim() : '',
+    topic: '',
     status: 'idle',
     createdAt: nowIso,
     updatedAt: nowIso,
     updatedMs: nowMs,
     seq: 0,
     messages: [],
-    cursors: {
-      antigravity: 0,
-      claude: 0,
-    },
+    cursors: { antigravity: 0, claude: 0 },
     presence: {
       antigravity: { state: 'idle', sinceMs: nowMs, updatedMs: nowMs, detail: 'Idle' },
       claude: { state: 'idle', sinceMs: nowMs, updatedMs: nowMs, detail: 'Idle' },
@@ -190,41 +314,32 @@ function createFreshRoomState(roomName, topic) {
   };
 }
 
-function readRoomStateRawSync(stateFile, roomName) {
-  if (!fs.existsSync(stateFile)) {
-    return createFreshRoomState(roomName, '');
-  }
+function readRoomStateRawSync(stateFile, room) {
   try {
-    const raw = fs.readFileSync(stateFile, 'utf-8').replace(/^\uFEFF/, '');
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.messages)) {
-      return createFreshRoomState(roomName, '');
+    const parsed = readJsonSafe(stateFile);
+    if (!Array.isArray(parsed.messages)) {
+      return createFreshRoomState(room);
     }
-    if (!parsed.cursors) parsed.cursors = { antigravity: 0, claude: 0 };
-    if (!parsed.presence) {
-      const nowMs = Date.now();
-      parsed.presence = {
-        antigravity: { state: 'idle', sinceMs: nowMs, updatedMs: nowMs, detail: 'Idle' },
-        claude: { state: 'idle', sinceMs: nowMs, updatedMs: nowMs, detail: 'Idle' },
-      };
-    }
+    parsed.cursors ||= { antigravity: 0, claude: 0 };
+    parsed.presence ||= {};
     return parsed;
   } catch {
-    return createFreshRoomState(roomName, '');
+    ensureDirs();
+    const corruptPath = path.join(ARCHIVE_DIR, `corrupt-${room}-${Date.now()}.json`);
+    try {
+      fs.renameSync(stateFile, corruptPath);
+    } catch {
+      try {
+        fs.copyFileSync(stateFile, corruptPath);
+        fs.unlinkSync(stateFile);
+      } catch {}
+    }
+    return createFreshRoomState(room);
   }
-}
-
-function writeRoomStateRawSync(stateFile, state) {
-  ensureDirs();
-  const tmpFile = `${stateFile}.tmp.${process.pid}.${Date.now()}`;
-  fs.writeFileSync(tmpFile, JSON.stringify(state, null, 2), 'utf-8');
-  fs.renameSync(tmpFile, stateFile);
 }
 
 function archiveRoomStateSync(state) {
-  if (!state || !Array.isArray(state.messages) || state.messages.length === 0) {
-    return null;
-  }
+  if (state.messages.length === 0) return null;
   ensureDirs();
   const archiveFile = path.join(ARCHIVE_DIR, `${state.room}-${state.sessionId}.json`);
   try {
@@ -235,31 +350,61 @@ function archiveRoomStateSync(state) {
   }
 }
 
-function mutateRoomSync(roomName, mutatorFn) {
-  const { room, stateFile, lockFile } = getRoomPaths(roomName);
-  acquireLockSync(lockFile);
-  try {
-    const state = readRoomStateRawSync(stateFile, room);
-    const result = mutatorFn(state);
-    if (result && result.nextState) {
-      writeRoomStateRawSync(stateFile, result.nextState);
-    } else {
-      writeRoomStateRawSync(stateFile, state);
+function resetRoomStateInPlace(state, room) {
+  const archivedPath = archiveRoomStateSync(state);
+  const prevPresence = state.presence;
+  const fresh = createFreshRoomState(room);
+  for (const role of ['antigravity', 'claude']) {
+    const p = prevPresence[role];
+    if (
+      isFreshWaitingPresence(
+        p,
+        waitingDetail(oppositeRole(role), null),
+        fresh.updatedMs,
+        HEARTBEAT_UPDATE_MS * 3
+      )
+    ) {
+      fresh.presence[role] = p;
     }
-    return result;
-  } finally {
-    releaseLockSync(lockFile);
   }
+  Object.assign(state, fresh);
+  return archivedPath;
 }
 
-function readRoomSync(roomName) {
-  const { room, stateFile } = getRoomPaths(roomName);
-  return readRoomStateRawSync(stateFile, room);
+const activeWaits = new Map();
+
+function mutateRoomSync(roomName, mutatorFn) {
+  const { room, stateFile, lockFile } = getRoomPaths(roomName);
+  const token = acquireLockSync(lockFile);
+  let wrote = false;
+  let result;
+  try {
+    const state = readRoomStateRawSync(stateFile, room);
+    result = mutatorFn(state) || {};
+    if (!result.skipWrite) {
+      writeJsonAtomic(stateFile, state);
+      wrote = true;
+    }
+    if (!result.payload && (wrote || result.baselineSessionId)) {
+      try {
+        const st = fs.statSync(stateFile);
+        result._stat = { mtimeMs: st.mtimeMs, size: st.size };
+      } catch {}
+    }
+  } finally {
+    releaseLockSync(lockFile, token);
+  }
+  if (wrote) {
+    for (const role of ['antigravity', 'claude']) {
+      activeWaits.get(`${room}:${role}`)?.wake();
+    }
+  }
+  return result;
 }
 
 function getUnreadPeerMessages(state, selfRole) {
   const peerRole = oppositeRole(selfRole);
-  const cursor = Number(state.cursors?.[selfRole] || 0);
+  const cursor = Number(state.cursors[selfRole] || 0);
   return state.messages.filter((m) => m.from === peerRole && m.seq > cursor);
 }
 
@@ -269,25 +414,50 @@ function formatPresenceSummary(presenceObj) {
   return `${presenceObj.state} (${presenceObj.detail || 'no detail'}, updated ${ageSec}s ago)`;
 }
 
-function buildDeliveryPayload({ state, selfRole, peerRole, deliveredMessages, eventType, note }) {
-  const latest = deliveredMessages[deliveredMessages.length - 1] || null;
-  const isConverged = state.status === 'converged' || (latest && latest.stance === 'agreed');
+function consumeUnreadPeerMessages(state, selfRole, eventType = 'message_received', note) {
+  const unread = getUnreadPeerMessages(state, selfRole);
+  if (unread.length === 0) return null;
 
-  let instruction = '';
-  if (eventType === 'unread_inbox_first') {
+  const peerRole = oppositeRole(selfRole);
+  const latest = unread[unread.length - 1];
+  const latestSeq = latest.seq;
+  const nowMs = Date.now();
+  const isConverged = state.status === 'converged' || latest.stance === 'agreed';
+  const unreadFirst = eventType === 'unread_inbox_first';
+  state.cursors[selfRole] = latestSeq;
+
+  setPresence(
+    state,
+    selfRole,
+    isConverged ? 'idle' : 'working',
+    isConverged
+      ? `Converged at #${latestSeq}`
+      : unreadFirst
+        ? `Read unread #${latestSeq} from ${peerRole} before sending`
+        : `Received #${latestSeq} from ${peerRole}, working on reply`,
+    nowMs
+  );
+
+  state.updatedMs = nowMs;
+  state.updatedAt = new Date(nowMs).toISOString();
+
+  let instruction;
+  if (unreadFirst) {
     instruction =
-      `HOLD ON: ${peerRole} already sent message #${latest.seq} while you were not listening. ` +
+      `HOLD ON: ${peerRole} already sent message #${latestSeq} (stance: "${latest.stance}") while you were not listening. ` +
       `Your outgoing message was NOT sent yet so you do not talk past each other. ` +
       `1) Summarize ${peerRole}'s message for the user in your chat. ` +
-      `2) Reconcile their points with your analysis and any user instructions. ` +
-      `3) Call peer_exchange again to send your unified response.`;
+      (isConverged
+        ? `2) If you also agree 100% with zero further changes, stop calling bridge tools and present the final plan; otherwise call peer_exchange again to send your response.`
+        : `2) Reconcile their points with your analysis and any user instructions. ` +
+          `3) Call peer_exchange again to send your unified response.`);
   } else if (isConverged) {
     instruction =
       `CONSENSUS REACHED: Both ${selfRole} and ${peerRole} have converged on the plan (stance: "agreed"). ` +
       `Stop calling peer_exchange/peer_wait and present the final unified plan clearly to the user.`;
   } else {
     instruction =
-      `Received reply #${latest.seq} from ${peerRole} (stance: "${latest.stance}"). ` +
+      `Received reply #${latestSeq} from ${peerRole} (stance: "${latest.stance}"). ` +
       `Next steps: ` +
       `1) First write a concise update in your chat window so the user can see what ${peerRole} argued and your assessment. ` +
       `2) Verify claims against the codebase and run measurements/benchmarks if needed. ` +
@@ -296,7 +466,7 @@ function buildDeliveryPayload({ state, selfRole, peerRole, deliveredMessages, ev
   }
 
   return {
-    status: isConverged ? 'converged' : eventType || 'message_received',
+    status: unreadFirst ? 'unread_inbox_first' : isConverged ? 'converged' : eventType,
     room: state.room,
     session_id: state.sessionId,
     topic: state.topic || '(untitled)',
@@ -304,141 +474,212 @@ function buildDeliveryPayload({ state, selfRole, peerRole, deliveredMessages, ev
     self: selfRole,
     peer: peerRole,
     total_messages: state.seq,
-    peer_message: latest
-      ? {
-          seq: latest.seq,
-          from: latest.from,
-          stance: latest.stance,
-          timestamp: latest.timestamp,
-          content: latest.content,
-        }
-      : null,
-    all_unread_delivered: deliveredMessages.length > 1 ? deliveredMessages : undefined,
+    peer_message: {
+      seq: latestSeq,
+      from: latest.from,
+      stance: latest.stance,
+      timestamp: latest.timestamp,
+      content: latest.content,
+    },
+    all_unread_delivered: unread.length > 1 ? unread : undefined,
     note: note || undefined,
     instruction,
   };
 }
 
+function cancelActiveWait(room, selfRole, reason = 'superseded') {
+  const key = `${room}:${selfRole}`;
+  const ctrl = activeWaits.get(key);
+  if (!ctrl) return;
+
+  ctrl.cancelled = true;
+  ctrl.cancelReason = reason;
+  activeWaits.delete(key);
+  ctrl.wake();
+
+  if (reason === 'rpc_cancelled') {
+    try {
+      mutateRoomSync(room, (state) => {
+        if (state.presence[selfRole]?.state === 'waiting') {
+          setPresence(state, selfRole, 'idle', 'Wait cancelled', Date.now());
+          return {};
+        }
+        return { skipWrite: true };
+      });
+    } catch {}
+  }
+}
+
+function cancelWaitByRequestId(requestId) {
+  if (requestId == null) return;
+  for (const ctrl of activeWaits.values()) {
+    if (ctrl.requestId != null && String(ctrl.requestId) === String(requestId)) {
+      cancelActiveWait(ctrl.room, ctrl.selfRole, 'rpc_cancelled');
+      return;
+    }
+  }
+}
+
 async function waitForPeerTurn({
-  roomName,
+  room,
   selfRole,
   peerRole,
   baselineSessionId,
   timeoutSec,
   sentSeq,
+  hadActiveSession,
+  requestId,
+  _stat,
+  lastHeartbeatMs,
+  peerPresence,
+  note,
 }) {
-  const clampedSec = Math.min(MAX_WAIT_SEC, Math.max(5, Number(timeoutSec) || DEFAULT_WAIT_SEC));
+  const clampedSec = normalizeTimeoutSec(timeoutSec);
   const deadlineMs = Date.now() + clampedSec * 1000;
-  const { stateFile } = getRoomPaths(roomName);
+  const { stateFile } = getRoomPaths(room);
+  let currentSessionId = baselineSessionId;
+  let latestPeerPresence = peerPresence;
 
-  let lastHeartbeatWriteMs = Date.now();
-  let lastObservedMtimeMs = 0;
-
-  let watcher = null;
+  let woken = false;
   let wakeResolver = null;
   const triggerWake = () => {
-    if (wakeResolver) {
-      const r = wakeResolver;
-      wakeResolver = null;
-      r();
-    }
+    woken = true;
+    if (wakeResolver) wakeResolver();
   };
 
+  const waitCtrl = {
+    room,
+    selfRole,
+    requestId,
+    cancelled: false,
+    cancelReason: null,
+    wake: triggerWake,
+  };
+  const agentKey = `${room}:${selfRole}`;
+  activeWaits.set(agentKey, waitCtrl);
+
+  let lastHeartbeatWriteMs = lastHeartbeatMs || Date.now();
+  let lastMtime = _stat?.mtimeMs || 0;
+  let lastSize = _stat?.size ?? -1;
+  let watcher = null;
+
   try {
-    ensureDirs();
-    watcher = fs.watch(DATA_DIR, (eventType, filename) => {
-      if (!filename || filename.includes(`room-${sanitizeRoomName(roomName)}`)) {
+    watcher = fs.watch(DATA_DIR, (_eventType, filename) => {
+      if (!filename || filename === `room-${room}.json`) {
         triggerWake();
       }
     });
+    watcher.on('error', () => {});
   } catch {}
 
   try {
-    while (Date.now() < deadlineMs) {
-      let shouldInspect = false;
+    while (!waitCtrl.cancelled) {
+      let fileChanged = false;
+      let currentStat = null;
       try {
-        if (fs.existsSync(stateFile)) {
-          const stat = fs.statSync(stateFile);
-          if (stat.mtimeMs !== lastObservedMtimeMs) {
-            lastObservedMtimeMs = stat.mtimeMs;
-            shouldInspect = true;
-          }
+        currentStat = fs.statSync(stateFile);
+        if (currentStat.mtimeMs !== lastMtime || currentStat.size !== lastSize) {
+          fileChanged = true;
         }
-      } catch {
-        shouldInspect = true;
-      }
-
-      if (shouldInspect) {
-        const checkResult = mutateRoomSync(roomName, (state) => {
-          const sessionChanged = baselineSessionId && state.sessionId !== baselineSessionId;
-          const unread = getUnreadPeerMessages(state, selfRole);
-          if (unread.length > 0) {
-            const latestSeq = unread[unread.length - 1].seq;
-            state.cursors[selfRole] = latestSeq;
-            const nowMs = Date.now();
-            const isConverged =
-              state.status === 'converged' || unread[unread.length - 1].stance === 'agreed';
-            state.presence[selfRole] = {
-              state: isConverged ? 'idle' : 'working',
-              sinceMs: nowMs,
-              updatedMs: nowMs,
-              detail: isConverged
-                ? `Converged at #${latestSeq}`
-                : `Received #${latestSeq} from ${peerRole}, working on reply`,
-            };
-            state.updatedMs = nowMs;
-            state.updatedAt = new Date(nowMs).toISOString();
-            return {
-              delivered: true,
-              payload: buildDeliveryPayload({
-                state,
-                selfRole,
-                peerRole,
-                deliveredMessages: unread,
-                eventType: 'message_received',
-                note: sessionChanged ? 'Peer started a new session.' : undefined,
-              }),
-            };
-          }
-          return { delivered: false };
-        });
-
-        if (checkResult && checkResult.delivered) {
-          return checkResult.payload;
+      } catch (err) {
+        if (err.code !== 'ENOENT' || lastMtime !== 0) {
+          lastMtime = 0;
+          lastSize = -1;
+          fileChanged = true;
         }
       }
 
       const nowMs = Date.now();
-      if (nowMs - lastHeartbeatWriteMs >= HEARTBEAT_UPDATE_MS) {
-        lastHeartbeatWriteMs = nowMs;
-        mutateRoomSync(roomName, (state) => {
-          const prev = state.presence[selfRole] || { sinceMs: nowMs };
-          state.presence[selfRole] = {
-            state: 'waiting',
-            sinceMs: prev.sinceMs || nowMs,
-            updatedMs: nowMs,
-            detail: sentSeq
-              ? `Waiting for ${peerRole}'s reply to #${sentSeq}`
-              : `Listening for ${peerRole}`,
-          };
-          return {};
+      const heartbeatDue =
+        nowMs < deadlineMs && nowMs - lastHeartbeatWriteMs >= HEARTBEAT_UPDATE_MS;
+
+      if (fileChanged || woken || heartbeatDue) {
+        woken = false;
+        const checkResult = mutateRoomSync(room, (state) => {
+          latestPeerPresence = state.presence[peerRole];
+          const changed = state.sessionId !== currentSessionId;
+          const combinedNote =
+            [note, changed ? 'Peer started a new session.' : null].filter(Boolean).join(' ') ||
+            undefined;
+          const payload = consumeUnreadPeerMessages(
+            state,
+            selfRole,
+            'message_received',
+            combinedNote
+          );
+          if (payload) {
+            return { payload };
+          }
+
+          if (changed) {
+            if (sentSeq || hadActiveSession) {
+              setPresence(state, selfRole, 'idle', 'Room reset while waiting', nowMs);
+              return {
+                payload: {
+                  status: 'session_reset',
+                  room: state.room,
+                  session_id: state.sessionId,
+                  self: selfRole,
+                  peer: peerRole,
+                  note: note || undefined,
+                  instruction:
+                    'The bridge room was reset while waiting for a reply. Stop waiting and ask the user how to proceed.',
+                },
+              };
+            }
+            currentSessionId = state.sessionId;
+          }
+
+          const mutualGuard = checkMutualWaitGuard(state, selfRole, peerRole, sentSeq, nowMs);
+          if (mutualGuard) {
+            return mutualGuard;
+          }
+
+          if (heartbeatDue || state.presence[selfRole]?.state !== 'waiting') {
+            lastHeartbeatWriteMs = nowMs;
+            setPresence(
+              state,
+              selfRole,
+              'waiting',
+              waitingDetail(peerRole, sentSeq),
+              nowMs,
+              true
+            );
+            return {};
+          }
+
+          return { skipWrite: true };
         });
+
+        const nextStat = checkResult._stat || currentStat;
+        if (nextStat) {
+          lastMtime = nextStat.mtimeMs;
+          lastSize = nextStat.size;
+        }
+        if (checkResult.payload) {
+          return checkResult.payload;
+        }
       }
 
       const remainingMs = deadlineMs - Date.now();
       if (remainingMs <= 0) break;
 
       await new Promise((resolve) => {
-        wakeResolver = resolve;
-        setTimeout(() => {
-          if (wakeResolver === resolve) {
-            wakeResolver = null;
-            resolve();
-          }
+        const timer = setTimeout(() => {
+          wakeResolver = null;
+          resolve();
         }, Math.min(POLL_INTERVAL_MS, remainingMs));
+        wakeResolver = () => {
+          clearTimeout(timer);
+          wakeResolver = null;
+          resolve();
+        };
       });
     }
   } finally {
+    if (activeWaits.get(agentKey) === waitCtrl) {
+      activeWaits.delete(agentKey);
+    }
     if (watcher) {
       try {
         watcher.close();
@@ -446,28 +687,37 @@ async function waitForPeerTurn({
     }
   }
 
-  const finalState = readRoomSync(roomName);
-  const peerPres = finalState.presence?.[peerRole];
+  if (waitCtrl.cancelled) {
+    return {
+      status: 'cancelled',
+      room,
+      self: selfRole,
+      peer: peerRole,
+      reason: waitCtrl.cancelReason,
+      instruction: 'Wait was cancelled or superseded by a newer request.',
+    };
+  }
+
+  const peerPresSummary = formatPresenceSummary(latestPeerPresence);
   return {
     status: 'waiting_heartbeat',
-    room: finalState.room,
-    session_id: finalState.sessionId,
+    room,
+    session_id: currentSessionId,
     self: selfRole,
     peer: peerRole,
     waited_sec: clampedSec,
     sent_seq: sentSeq || undefined,
-    peer_presence: formatPresenceSummary(peerPres),
+    note: note || undefined,
+    peer_presence: peerPresSummary,
     instruction:
-      `${peerRole} has not replied yet after ${clampedSec}s (${formatPresenceSummary(peerPres)}). ` +
+      `${peerRole} has not replied yet after ${clampedSec}s (${peerPresSummary}). ` +
       `They may still be running benchmarks, reading files, or waiting for user input. ` +
       `Call peer_wait() immediately without stopping your turn so you receive their reply as soon as they finish.`,
   };
 }
 
-async function handlePeerExchange(args) {
-  const selfRole = getSelfRole(args.agent);
-  const peerRole = oppositeRole(selfRole);
-  const roomName = sanitizeRoomName(args.room || cliOpts.room);
+async function handlePeerExchange(args = {}, requestId) {
+  const { selfRole, peerRole, room } = resolveContext(args);
   const message = String(args.message || '').trim();
   if (!message) {
     throw new Error('Parameter "message" is required and cannot be empty.');
@@ -479,234 +729,234 @@ async function handlePeerExchange(args) {
   }
 
   const waitForReply = args.wait_for_reply !== false;
-  const timeoutSec = args.timeout_sec || DEFAULT_WAIT_SEC;
+  const timeoutSec = normalizeTimeoutSec(args.timeout_sec);
   const explicitNewSession = Boolean(args.new_session);
+  const trimmedTopic = String(args.topic || '').trim();
 
-  const sendOutcome = mutateRoomSync(roomName, (state) => {
+  cancelActiveWait(room, selfRole);
+
+  const sendOutcome = mutateRoomSync(room, (state) => {
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
     const isStale = state.seq > 0 && nowMs - (state.updatedMs || 0) > STALE_SESSION_MS;
+    const hasNewTopic = Boolean(trimmedTopic && state.topic && trimmedTopic !== state.topic);
 
-    if (explicitNewSession || (isStale && stance === 'propose')) {
-      archiveRoomStateSync(state);
-      const fresh = createFreshRoomState(roomName, args.topic || '');
-      Object.assign(state, fresh);
+    if (!explicitNewSession) {
+      const unreadPayload = consumeUnreadPeerMessages(state, selfRole, 'unread_inbox_first');
+      if (unreadPayload) {
+        return { payload: unreadPayload };
+      }
+
+      if (state.status === 'converged' && stance === 'agreed' && !isStale && !hasNewTopic) {
+        const wasIdle = state.presence[selfRole]?.state === 'idle';
+        if (!wasIdle) setPresence(state, selfRole, 'idle', `Agreed at #${state.seq}`, nowMs);
+        return {
+          skipWrite: wasIdle,
+          payload: buildConvergedPayload(
+            state,
+            selfRole,
+            peerRole,
+            state.seq,
+            `CONSENSUS ALREADY REACHED at #${state.seq}: Both ${selfRole} and ${peerRole} have converged on the plan. ` +
+              `Stop calling bridge tools and present the final agreed plan to the user.`
+          ),
+        };
+      }
     }
 
-    if (args.topic && !state.topic) {
-      state.topic = String(args.topic).trim();
+    if (
+      explicitNewSession ||
+      (isStale && (stance === 'propose' || getUnreadPeerMessages(state, peerRole).length === 0)) ||
+      (state.status === 'converged' && (stance === 'propose' || hasNewTopic))
+    ) {
+      resetRoomStateInPlace(state, room);
     }
 
-    const unreadFromPeer = getUnreadPeerMessages(state, selfRole);
-    if (unreadFromPeer.length > 0 && !explicitNewSession) {
-      const latestSeq = unreadFromPeer[unreadFromPeer.length - 1].seq;
-      state.cursors[selfRole] = latestSeq;
-      state.presence[selfRole] = {
-        state: 'working',
-        sinceMs: nowMs,
-        updatedMs: nowMs,
-        detail: `Read unread #${latestSeq} from ${peerRole} before sending`,
-      };
-      state.updatedMs = nowMs;
-      state.updatedAt = nowIso;
-      return {
-        action: 'deliver_unread_first',
-        payload: buildDeliveryPayload({
-          state,
-          selfRole,
-          peerRole,
-          deliveredMessages: unreadFromPeer,
-          eventType: 'unread_inbox_first',
-        }),
-      };
+    if (trimmedTopic && (stance === 'propose' || !state.topic)) {
+      state.topic = trimmedTopic;
     }
 
-    const peerHasPriorMessages = state.messages.some((m) => m.from === peerRole);
+    const lastMsg = state.messages[state.messages.length - 1];
+    const canAgreeToPeer = Boolean(lastMsg && lastMsg.from === peerRole);
     let effectiveStance = stance;
     let note = null;
-    if (effectiveStance === 'agreed' && !peerHasPriorMessages) {
-      effectiveStance = 'propose';
-      note =
-        'Downgraded stance from "agreed" to "propose" because peer has not reviewed or sent any message in this session yet.';
+    if (effectiveStance === 'agreed' && !canAgreeToPeer) {
+      effectiveStance = lastMsg ? 'critique' : 'propose';
+      note = lastMsg
+        ? `Downgraded stance from "agreed" to "critique" because ${peerRole} has not replied to your latest message (#${lastMsg.seq}) yet.`
+        : 'Downgraded stance from "agreed" to "propose" because peer has not reviewed or sent any message in this session yet.';
     }
 
     const nextSeq = state.seq + 1;
     state.seq = nextSeq;
-    const msgObj = {
+    state.messages.push({
       seq: nextSeq,
       from: selfRole,
       to: peerRole,
       stance: effectiveStance,
       content: message,
       timestamp: nowIso,
-    };
-    state.messages.push(msgObj);
+    });
     state.cursors[selfRole] = nextSeq;
     state.updatedMs = nowMs;
     state.updatedAt = nowIso;
 
     if (effectiveStance === 'agreed') {
       state.status = 'converged';
-      state.presence[selfRole] = {
-        state: 'idle',
-        sinceMs: nowMs,
-        updatedMs: nowMs,
-        detail: `Agreed at #${nextSeq}`,
-      };
+      setPresence(state, selfRole, 'idle', `Agreed at #${nextSeq}`, nowMs);
       return {
-        action: 'converged_immediately',
-        payload: {
-          status: 'converged',
-          room: state.room,
-          session_id: state.sessionId,
-          topic: state.topic || '(untitled)',
-          self: selfRole,
-          peer: peerRole,
-          sent_seq: nextSeq,
-          stance: effectiveStance,
-          instruction:
-            `CONSENSUS REACHED: You (${selfRole}) agreed with ${peerRole}'s latest proposal (#${nextSeq}). ` +
-            `${peerRole} has been notified and unlocked. Stop calling bridge tools and present the final agreed plan to the user.`,
-        },
+        payload: buildConvergedPayload(
+          state,
+          selfRole,
+          peerRole,
+          nextSeq,
+          `CONSENSUS REACHED: You (${selfRole}) agreed with ${peerRole}'s latest proposal (#${nextSeq}). ` +
+            `${peerRole} has been notified and unlocked. Stop calling bridge tools and present the final agreed plan to the user.`
+        ),
       };
     }
 
     state.status = 'active';
-    state.presence[selfRole] = {
-      state: waitForReply ? 'waiting' : 'idle',
-      sinceMs: nowMs,
-      updatedMs: nowMs,
-      detail: waitForReply
-        ? `Sent #${nextSeq} (${effectiveStance}), waiting for ${peerRole}`
-        : `Sent #${nextSeq} (${effectiveStance})`,
-    };
+    setPresence(
+      state,
+      selfRole,
+      waitForReply ? 'waiting' : 'idle',
+      waitForReply ? waitingDetail(peerRole, nextSeq) : `Sent #${nextSeq} (${effectiveStance})`,
+      nowMs
+    );
+
+    if (!waitForReply) {
+      return {
+        payload: {
+          status: 'sent',
+          room: state.room,
+          session_id: state.sessionId,
+          self: selfRole,
+          peer: peerRole,
+          sent_seq: nextSeq,
+          stance: effectiveStance,
+          note: note || undefined,
+          instruction: `Message #${nextSeq} queued for ${peerRole} without blocking. Call peer_wait() when you are ready to listen for their reply.`,
+        },
+      };
+    }
 
     return {
-      action: waitForReply ? 'wait_for_peer' : 'sent_no_wait',
-      sessionId: state.sessionId,
+      baselineSessionId: state.sessionId,
       sentSeq: nextSeq,
-      effectiveStance,
+      hadActiveSession: true,
+      lastHeartbeatMs: nowMs,
+      peerPresence: state.presence[peerRole],
       note,
     };
   });
 
-  if (
-    sendOutcome.action === 'deliver_unread_first' ||
-    sendOutcome.action === 'converged_immediately'
-  ) {
+  if (sendOutcome.payload) {
     return sendOutcome.payload;
   }
 
-  if (sendOutcome.action === 'sent_no_wait') {
-    return {
-      status: 'sent',
-      room: roomName,
-      session_id: sendOutcome.sessionId,
-      self: selfRole,
-      peer: peerRole,
-      sent_seq: sendOutcome.sentSeq,
-      stance: sendOutcome.effectiveStance,
-      note: sendOutcome.note || undefined,
-      instruction: `Message #${sendOutcome.sentSeq} queued for ${peerRole} without blocking. Call peer_wait() when you are ready to listen for their reply.`,
-    };
-  }
-
   return waitForPeerTurn({
-    roomName,
+    room,
     selfRole,
     peerRole,
-    baselineSessionId: sendOutcome.sessionId,
     timeoutSec,
-    sentSeq: sendOutcome.sentSeq,
+    requestId,
+    ...sendOutcome,
   });
 }
 
-async function handlePeerWait(args) {
-  const selfRole = getSelfRole(args.agent);
-  const peerRole = oppositeRole(selfRole);
-  const roomName = sanitizeRoomName(args.room || cliOpts.room);
-  const timeoutSec = args.timeout_sec || DEFAULT_WAIT_SEC;
+async function handlePeerWait(args = {}, requestId) {
+  const { selfRole, peerRole, room } = resolveContext(args);
+  const timeoutSec = normalizeTimeoutSec(args.timeout_sec);
 
-  const initialCheck = mutateRoomSync(roomName, (state) => {
+  cancelActiveWait(room, selfRole);
+
+  const initialCheck = mutateRoomSync(room, (state) => {
+    const unreadPayload = consumeUnreadPeerMessages(state, selfRole, 'message_received');
+    if (unreadPayload) {
+      return { payload: unreadPayload };
+    }
+
     const nowMs = Date.now();
-    const unread = getUnreadPeerMessages(state, selfRole);
-    if (unread.length > 0) {
-      const latestSeq = unread[unread.length - 1].seq;
-      state.cursors[selfRole] = latestSeq;
-      const isConverged =
-        state.status === 'converged' || unread[unread.length - 1].stance === 'agreed';
-      state.presence[selfRole] = {
-        state: isConverged ? 'idle' : 'working',
-        sinceMs: nowMs,
-        updatedMs: nowMs,
-        detail: isConverged
-          ? `Converged at #${latestSeq}`
-          : `Received #${latestSeq} from ${peerRole}, working on reply`,
-      };
-      state.updatedMs = nowMs;
-      state.updatedAt = new Date(nowMs).toISOString();
+    const lastMsg = state.messages[state.messages.length - 1];
+    if (state.status === 'active' && lastMsg && lastMsg.from === peerRole) {
+      const wasWaiting = state.presence[selfRole]?.state === 'waiting';
+      if (wasWaiting) {
+        setPresence(state, selfRole, 'working', `Working on reply to #${lastMsg.seq}`, nowMs);
+      }
       return {
-        immediate: true,
-        payload: buildDeliveryPayload({
-          state,
-          selfRole,
-          peerRole,
-          deliveredMessages: unread,
-          eventType: 'message_received',
-        }),
+        skipWrite: !wasWaiting,
+        payload: {
+          status: 'your_turn_to_reply',
+          room: state.room,
+          session_id: state.sessionId,
+          self: selfRole,
+          peer: peerRole,
+          last_peer_seq: lastMsg.seq,
+          instruction:
+            `DO NOT WAIT: You (${selfRole}) already received ${peerRole}'s latest message (#${lastMsg.seq}) and it is YOUR turn to reply. ` +
+            `Do not call peer_wait while running subagents, background tasks, or code reviews. ` +
+            `Finish your analysis or wait for your subagents to complete first, then send your response with peer_exchange().`,
+        },
       };
     }
 
-    state.presence[selfRole] = {
-      state: 'waiting',
-      sinceMs: nowMs,
-      updatedMs: nowMs,
-      detail: `Listening for ${peerRole}`,
-    };
+    const sentSeq =
+      state.status === 'active' && lastMsg && lastMsg.from === selfRole ? lastMsg.seq : null;
+    const mutualGuard = checkMutualWaitGuard(state, selfRole, peerRole, sentSeq, nowMs);
+    if (mutualGuard) {
+      return mutualGuard;
+    }
+
+    const desiredDetail = waitingDetail(peerRole, sentSeq);
+
+    const prevPres = state.presence[selfRole];
+    const alreadyWaitingFresh = isFreshWaitingPresence(prevPres, desiredDetail, nowMs);
+
+    if (!alreadyWaitingFresh) {
+      setPresence(state, selfRole, 'waiting', desiredDetail, nowMs, prevPres?.state === 'waiting');
+    }
     return {
-      immediate: false,
+      skipWrite: alreadyWaitingFresh,
       baselineSessionId: state.sessionId,
+      sentSeq,
+      hadActiveSession: state.status === 'active',
+      lastHeartbeatMs: alreadyWaitingFresh ? prevPres.updatedMs : nowMs,
+      peerPresence: state.presence[peerRole],
     };
   });
 
-  if (initialCheck.immediate) {
+  if (initialCheck.payload) {
     return initialCheck.payload;
   }
 
   return waitForPeerTurn({
-    roomName,
+    room,
     selfRole,
     peerRole,
-    baselineSessionId: initialCheck.baselineSessionId,
     timeoutSec,
-    sentSeq: null,
+    requestId,
+    ...initialCheck,
   });
 }
 
-function handlePeerStatus(args) {
-  const selfRole = getSelfRole(args.agent);
-  const peerRole = oppositeRole(selfRole);
-  const roomName = sanitizeRoomName(args.room || cliOpts.room);
+function handlePeerStatus(args = {}) {
+  const { selfRole, peerRole, room } = resolveContext(args);
   const action = String(args.action || 'status').trim().toLowerCase();
 
   if (action === 'reset') {
-    let archivedPath = null;
-    const fresh = mutateRoomSync(roomName, (state) => {
-      archivedPath = archiveRoomStateSync(state);
-      const nextState = createFreshRoomState(roomName, '');
-      return { nextState };
-    });
-    return {
-      status: 'reset_complete',
-      room: roomName,
-      archived_previous_to: archivedPath,
-      new_session_id: fresh.nextState.sessionId,
-      instruction: 'Room has been archived and reset. Ready for a new discussion.',
-    };
+    return mutateRoomSync(room, (state) => ({
+      payload: {
+        status: 'reset_complete',
+        room,
+        archived_previous_to: resetRoomStateInPlace(state, room),
+        new_session_id: state.sessionId,
+        instruction: 'Room has been archived and reset. Ready for a new discussion.',
+      },
+    })).payload;
   }
 
-  const state = readRoomSync(roomName);
-  const unreadCount = getUnreadPeerMessages(state, selfRole).length;
+  const state = readRoomStateRawSync(getRoomPaths(room).stateFile, room);
   return {
     status: 'ok',
     room: state.room,
@@ -716,16 +966,17 @@ function handlePeerStatus(args) {
     self: selfRole,
     peer: peerRole,
     seq: state.seq,
-    unread_for_self: unreadCount,
+    unread_for_self: getUnreadPeerMessages(state, selfRole).length,
     cursors: state.cursors,
     presence: {
-      antigravity: formatPresenceSummary(state.presence?.antigravity),
-      claude: formatPresenceSummary(state.presence?.claude),
+      antigravity: formatPresenceSummary(state.presence.antigravity),
+      claude: formatPresenceSummary(state.presence.claude),
     },
     messages: state.messages,
   };
 }
 
+// `room` and `agent` are intentionally omitted from MCP_TOOLS schemas so each LLM uses its configured server identity on the default room.
 const MCP_TOOLS = [
   {
     name: 'peer_exchange',
@@ -736,7 +987,8 @@ const MCP_TOOLS = [
       '2. Be rigorous: verify claims against the codebase and run measurements/benchmarks when performance or behavior is in question. Never agree out of politeness.\n' +
       '3. Address points explicitly (e.g. "Point 1: Agree. Point 2: Disagree because...").\n' +
       '4. Set stance="propose" for an initial plan or major revision; stance="critique" whenever you have ANY objection, counter-proposal, or improvement; stance="agreed" ONLY when you have zero remaining objections or improvements to the peer\'s latest plan.\n' +
-      '5. If peer_exchange returns status="waiting_heartbeat" (because the peer is running long measurements), immediately call peer_wait() to keep waiting.',
+      '5. If peer_exchange returns status="waiting_heartbeat" (because the peer is running long measurements), immediately call peer_wait() to keep waiting.\n' +
+      '6. NEVER call peer_exchange(wait_for_reply=true) or peer_wait() while you have a background subagent or background task running, because blocking in a bridge tool prevents your own subagents from waking you up.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -770,12 +1022,6 @@ const MCP_TOOLS = [
           description:
             'Seconds to wait per heartbeat cycle before returning status="waiting_heartbeat" (default: 45, max: 120).',
         },
-        agent: {
-          type: 'string',
-          enum: ['antigravity', 'claude'],
-          description:
-            'Optional override for your agent identity (auto-detected from server args or MCP clientInfo by default).',
-        },
       },
       required: ['message', 'stance'],
     },
@@ -787,6 +1033,10 @@ const MCP_TOOLS = [
       'When to use:\n' +
       '1. When the user tells you to listen on the bridge / wait for the other agent to send a plan.\n' +
       '2. Immediately after peer_exchange or peer_wait returns status="waiting_heartbeat" (meaning the peer is still analyzing code or running measurements).\n\n' +
+      'When NOT to use:\n' +
+      '- NEVER call peer_wait while you have a background subagent or background task running (blocking in peer_wait prevents your own subagents from waking you up).\n' +
+      '- NEVER call peer_wait when you already received the peer\'s latest message and it is YOUR turn to reply (finish your work/subagents first, then call peer_exchange).\n' +
+      '- NEVER call peer_wait if peer_wait returns status="your_turn_to_reply" or status="mutual_wait_prevented".\n\n' +
       'When a message arrives: summarize the peer\'s points for the user in your chat window, perform any needed checks/measurements, and reply with peer_exchange (unless status="converged").',
     inputSchema: {
       type: 'object',
@@ -795,11 +1045,6 @@ const MCP_TOOLS = [
           type: 'number',
           description:
             'Seconds to wait before returning a waiting_heartbeat reminder (default: 45, max: 120).',
-        },
-        agent: {
-          type: 'string',
-          enum: ['antigravity', 'claude'],
-          description: 'Optional override for your agent identity.',
         },
       },
     },
@@ -825,20 +1070,25 @@ const MCP_TOOLS = [
 let useContentLengthFraming = false;
 
 function sendJsonRpc(msgObj) {
+  if (!process.stdout.writable) return;
   const json = JSON.stringify(msgObj);
-  if (useContentLengthFraming) {
-    const byteLen = Buffer.byteLength(json, 'utf-8');
-    process.stdout.write(`Content-Length: ${byteLen}\r\n\r\n${json}`);
-  } else {
-    process.stdout.write(`${json}\n`);
-  }
+  const out = useContentLengthFraming
+    ? `Content-Length: ${Buffer.byteLength(json, 'utf-8')}\r\n\r\n${json}`
+    : `${json}\n`;
+  try {
+    process.stdout.write(out);
+  } catch {}
+}
+
+function sendResult(id, result) {
+  sendJsonRpc({ jsonrpc: '2.0', id, result });
 }
 
 async function handleJsonRpcMessage(msg) {
   if (!msg || typeof msg !== 'object') return;
 
   const { id, method, params } = msg;
-  const isNotification = id === undefined || id === null;
+  const isNotification = !Object.prototype.hasOwnProperty.call(msg, 'id') || id === undefined;
 
   try {
     if (method === 'initialize') {
@@ -846,90 +1096,71 @@ async function handleJsonRpcMessage(msg) {
       if (!detectedSelfRole && clientName) {
         detectedSelfRole = normalizeAgentRole(clientName);
       }
-      const requestedVersion = params?.protocolVersion || '2024-11-05';
-      sendJsonRpc({
-        jsonrpc: '2.0',
-        id,
-        result: {
-          protocolVersion: requestedVersion,
-          capabilities: {
-            tools: {},
-          },
-          serverInfo: {
-            name: SERVER_NAME,
-            version: SERVER_VERSION,
-          },
-        },
-      });
-      return;
-    }
-
-    if (method === 'notifications/initialized' || method === 'initialized') {
-      return;
-    }
-
-    if (method === 'ping') {
       if (!isNotification) {
-        sendJsonRpc({ jsonrpc: '2.0', id, result: {} });
+        sendResult(id, {
+          protocolVersion: params?.protocolVersion || '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+        });
       }
       return;
     }
 
+    if (method === 'notifications/initialized' || method === 'initialized') return;
+
+    if (method === 'notifications/cancelled' || method === '$/cancelRequest') {
+      cancelWaitByRequestId(params?.requestId ?? params?.id);
+      return;
+    }
+
+    if (method === 'ping') {
+      if (!isNotification) sendResult(id, {});
+      return;
+    }
+
     if (method === 'tools/list') {
-      sendJsonRpc({
-        jsonrpc: '2.0',
-        id,
-        result: {
-          tools: MCP_TOOLS,
-        },
-      });
+      if (!isNotification) sendResult(id, { tools: MCP_TOOLS });
       return;
     }
 
     if (method === 'resources/list') {
-      sendJsonRpc({
-        jsonrpc: '2.0',
-        id,
-        result: { resources: [] },
-      });
+      if (!isNotification) sendResult(id, { resources: [] });
       return;
     }
 
     if (method === 'prompts/list') {
-      sendJsonRpc({
-        jsonrpc: '2.0',
-        id,
-        result: { prompts: [] },
-      });
+      if (!isNotification) sendResult(id, { prompts: [] });
       return;
     }
 
     if (method === 'tools/call') {
       const toolName = params?.name;
-      const toolArgs = params?.arguments || {};
+      const rawArgs = params?.arguments;
+      if (rawArgs != null && (typeof rawArgs !== 'object' || Array.isArray(rawArgs))) {
+        throw new Error('Parameter "arguments" must be a JSON object.');
+      }
+      const toolArgs = rawArgs || {};
       let resultPayload;
 
       if (toolName === 'peer_exchange') {
-        resultPayload = await handlePeerExchange(toolArgs);
+        resultPayload = await handlePeerExchange(toolArgs, id);
       } else if (toolName === 'peer_wait') {
-        resultPayload = await handlePeerWait(toolArgs);
+        resultPayload = await handlePeerWait(toolArgs, id);
       } else if (toolName === 'peer_status') {
         resultPayload = handlePeerStatus(toolArgs);
       } else {
         throw new Error(`Unknown tool: ${toolName}`);
       }
 
-      sendJsonRpc({
-        jsonrpc: '2.0',
-        id,
-        result: {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(resultPayload, null, 2),
-            },
-          ],
-        },
+      if (
+        isNotification ||
+        (resultPayload?.status === 'cancelled' && resultPayload?.reason === 'rpc_cancelled')
+      ) {
+        return;
+      }
+
+      sendResult(id, {
+        content: [{ type: 'text', text: JSON.stringify(resultPayload, null, 2) }],
       });
       return;
     }
@@ -938,218 +1169,338 @@ async function handleJsonRpcMessage(msg) {
       sendJsonRpc({
         jsonrpc: '2.0',
         id,
-        error: {
-          code: -32601,
-          message: `Method not found: ${method}`,
-        },
+        error: { code: -32601, message: `Method not found: ${method}` },
       });
     }
   } catch (err) {
     if (!isNotification) {
-      sendJsonRpc({
-        jsonrpc: '2.0',
-        id,
-        result: {
-          isError: true,
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  status: 'error',
-                  error: err instanceof Error ? err.message : String(err),
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        },
+      sendResult(id, {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              { status: 'error', error: err instanceof Error ? err.message : String(err) },
+              null,
+              2
+            ),
+          },
+        ],
       });
     }
   }
 }
 
+const EMPTY_BUF = Buffer.alloc(0);
+const MAX_HEADER_BYTES = 4096;
+const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
+
 function startMcpStdioServer() {
-  let buffer = Buffer.alloc(0);
+  let buffer = EMPTY_BUF;
+  let exiting = false;
+  let stdinClosed = false;
+  let inFlight = 0;
 
-  process.stdin.on('data', (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-
-    while (buffer.length > 0) {
-      const preview = buffer.subarray(0, Math.min(buffer.length, 64)).toString('utf-8');
-      if (/^Content-Length:/i.test(preview)) {
-        useContentLengthFraming = true;
-        const headerEnd = buffer.indexOf('\r\n\r\n');
-        if (headerEnd === -1) break;
-        const headerStr = buffer.subarray(0, headerEnd).toString('utf-8');
-        const match = headerStr.match(/Content-Length:\s*(\d+)/i);
-        if (!match) {
-          buffer = buffer.subarray(headerEnd + 4);
-          continue;
-        }
-        const contentLen = parseInt(match[1], 10);
-        const bodyStart = headerEnd + 4;
-        if (buffer.length < bodyStart + contentLen) break;
-        const bodyStr = buffer.subarray(bodyStart, bodyStart + contentLen).toString('utf-8');
-        buffer = buffer.subarray(bodyStart + contentLen);
-        try {
-          const parsed = JSON.parse(bodyStr);
-          handleJsonRpcMessage(parsed);
-        } catch {}
-      } else {
-        const nlIdx = buffer.indexOf(0x0a);
-        if (nlIdx === -1) break;
-        const line = buffer.subarray(0, nlIdx).toString('utf-8').trim();
-        buffer = buffer.subarray(nlIdx + 1);
-        if (!line) continue;
-        try {
-          const parsed = JSON.parse(line);
-          handleJsonRpcMessage(parsed);
-        } catch {}
-      }
-    }
-  });
-
-  process.stdin.on('end', () => {
-    if (detectedSelfRole) {
+  const cleanupAndExit = () => {
+    if (exiting) return;
+    exiting = true;
+    if (detectedSelfRole && hasActivePresence) {
       try {
         mutateRoomSync(cliOpts.room, (state) => {
-          const nowMs = Date.now();
-          if (state.presence?.[detectedSelfRole]?.state === 'waiting') {
-            state.presence[detectedSelfRole] = {
-              state: 'idle',
-              sinceMs: nowMs,
-              updatedMs: nowMs,
-              detail: 'Disconnected',
-            };
+          if (state.presence[detectedSelfRole]?.state !== 'idle') {
+            setPresence(state, detectedSelfRole, 'idle', 'Disconnected', Date.now());
+            return {};
           }
-          return {};
+          return { skipWrite: true };
         });
       } catch {}
     }
     process.exit(0);
+  };
+
+  const onStdinEnd = () => {
+    stdinClosed = true;
+    if (inFlight === 0) cleanupAndExit();
+  };
+
+  process.stdin.on('data', (chunk) => {
+    buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
+    let offset = 0;
+
+    // Auto-detect LSP Content-Length framing vs newline-delimited JSON-RPC so both MCP stdio styles work.
+    while (offset < buffer.length) {
+      while (
+        offset < buffer.length &&
+        (buffer[offset] === 0x0d ||
+          buffer[offset] === 0x0a ||
+          buffer[offset] === 0x20 ||
+          buffer[offset] === 0x09)
+      ) {
+        offset++;
+      }
+      if (offset >= buffer.length) break;
+
+      let rawJson;
+      if (buffer[offset] !== 0x7b /* '{' */) {
+        const scanEnd = Math.min(buffer.length, offset + MAX_HEADER_BYTES);
+        const headerSlice = buffer.subarray(offset, scanEnd);
+        const crlfRel = headerSlice.indexOf('\r\n\r\n');
+        const lfSearchEnd = crlfRel !== -1 ? crlfRel : headerSlice.length;
+        const lfRel = headerSlice.subarray(0, lfSearchEnd).indexOf('\n\n');
+        const hasLf = lfRel !== -1;
+        const relEnd = hasLf ? lfRel : crlfRel;
+
+        if (relEnd === -1) {
+          if (buffer.length - offset >= MAX_HEADER_BYTES) {
+            buffer = EMPTY_BUF;
+            offset = 0;
+          }
+          break;
+        }
+
+        const headerEnd = offset + relEnd;
+        const sepLen = hasLf ? 2 : 4;
+        const bodyStart = headerEnd + sepLen;
+        const match = buffer
+          .toString('utf-8', offset, headerEnd)
+          .match(/Content-Length:\s*(\d+)/i);
+        if (!match) {
+          offset = bodyStart;
+          continue;
+        }
+        const contentLen = parseInt(match[1], 10);
+        if (contentLen > MAX_MESSAGE_BYTES) {
+          offset = bodyStart;
+          continue;
+        }
+        useContentLengthFraming = true;
+        if (buffer.length < bodyStart + contentLen) break;
+
+        rawJson = buffer.toString('utf-8', bodyStart, bodyStart + contentLen);
+        offset = bodyStart + contentLen;
+      } else {
+        const nlIdx = buffer.indexOf(0x0a, offset);
+        if (nlIdx === -1) {
+          if (buffer.length - offset > MAX_MESSAGE_BYTES) {
+            buffer = EMPTY_BUF;
+            offset = 0;
+          }
+          break;
+        }
+        rawJson = buffer.toString('utf-8', offset, nlIdx);
+        offset = nlIdx + 1;
+      }
+
+      let parsedMsg;
+      try {
+        parsedMsg = JSON.parse(rawJson);
+      } catch {
+        continue;
+      }
+      inFlight++;
+      handleJsonRpcMessage(parsedMsg)
+        .catch(() => {})
+        .finally(() => {
+          if (--inFlight === 0 && stdinClosed) cleanupAndExit();
+        });
+    }
+
+    if (offset >= buffer.length) {
+      buffer = EMPTY_BUF;
+    } else if (offset > 0) {
+      buffer = Buffer.from(buffer.subarray(offset));
+    }
   });
+
+  process.stdin.on('end', onStdinEnd);
+  process.stdin.on('close', onStdinEnd);
+  process.stdin.on('error', cleanupAndExit);
+  process.stdout.on('error', cleanupAndExit);
+  process.on('SIGINT', cleanupAndExit);
+  process.on('SIGTERM', cleanupAndExit);
+  process.on('SIGHUP', cleanupAndExit);
 }
 
 async function runSelfTest() {
-  const testRoom = `selftest_${ process.pid }`;
-  const { stateFile } = getRoomPaths(testRoom);
+  const testRoom = `selftest_${process.pid}`;
+  const { stateFile, lockFile } = getRoomPaths(testRoom);
+  const check = (cond, label, data) => {
+    if (!cond) throw new Error(`${label} failed${data !== undefined ? `: ${JSON.stringify(data)}` : ''}`);
+  };
+  const send = (agent, stance, message, extra = {}) =>
+    handlePeerExchange({ room: testRoom, agent, stance, message, timeout_sec: 10, ...extra });
+
   try {
-    // 1. Reset room
-    const r0 = handlePeerStatus({ room: testRoom, action: 'reset' });
-    if (r0.status !== 'reset_complete') throw new Error('Reset failed');
+    // 1. Reset room + verify first-turn "agreed" downgrade to "propose" (blocking + non-blocking) + archive on reset
+    check(handlePeerStatus({ room: testRoom, action: 'reset' }).status === 'reset_complete', 'Reset');
+    const down = await send('antigravity', 'agreed', 'Premature agreed', { wait_for_reply: false });
+    check(down.status === 'sent' && down.stance === 'propose' && down.note, 'Downgrade', down);
+    const arch = handlePeerStatus({ room: testRoom, action: 'reset' });
+    check(arch.archived_previous_to && fs.existsSync(arch.archived_previous_to), 'Archive', arch);
 
-    // 2. Start Claude waiting in background, while Antigravity proposes Plan v1
-    const claudeWaitPromise = handlePeerWait({
-      room: testRoom,
-      agent: 'claude',
-      timeout_sec: 10,
-    });
+    // 2. Multi-round concurrent debate (#1 propose -> #2 critique -> #3 critique -> #4 agreed)
+    const claudeWait1 = handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 10 });
+    const agyEx1 = send('antigravity', 'agreed', 'Plan v1: LRU + TTL 60s', { topic: 'Cache' });
+    const cRecv1 = await claudeWait1;
+    check(
+      cRecv1.status === 'message_received' &&
+        cRecv1.peer_message?.seq === 1 &&
+        cRecv1.peer_message?.stance === 'propose' &&
+        cRecv1.topic === 'Cache',
+      'cRecv1',
+      cRecv1
+    );
 
-    await sleepMs(250);
+    const claudeEx1 = send('claude', 'critique', 'Point 2 disagree: TTL 300s');
+    const aRecv1 = await agyEx1;
+    check(
+      aRecv1.status === 'message_received' && aRecv1.peer_message?.seq === 2 && Boolean(aRecv1.note),
+      'aRecv1',
+      aRecv1
+    );
 
-    // 3. Antigravity sends Plan v1 (propose) and waits for Claude's critique
-    const agyExchange1Promise = handlePeerExchange({
-      room: testRoom,
-      agent: 'antigravity',
-      topic: 'Cache Architecture',
-      stance: 'propose',
-      message: 'Plan v1: Point 1 use LRU, Point 2 use TTL 60s.',
-      timeout_sec: 10,
-    });
+    const agyEx2 = send('antigravity', 'critique', 'Plan v2: TTL 300s + hook');
+    const cRecv2 = await claudeEx1;
+    check(cRecv2.status === 'message_received' && cRecv2.peer_message?.seq === 3, 'cRecv2', cRecv2);
 
-    // Claude should immediately wake up with Plan v1 (#1)
-    const claudeRecv1 = await claudeWaitPromise;
-    if (claudeRecv1.status !== 'message_received' || claudeRecv1.peer_message?.seq !== 1) {
-      throw new Error(`Unexpected claudeRecv1: ${JSON.stringify(claudeRecv1)}`);
-    }
+    const cAgree = await send('claude', 'agreed', '100% agreed with Plan v2');
+    const aConv = await agyEx2;
+    check(cAgree.status === 'converged' && aConv.status === 'converged', 'Converge', { cAgree, aConv });
 
-    // 4. Claude critiques Point 2 (#2) and waits for Antigravity
-    const claudeExchange1Promise = handlePeerExchange({
-      room: testRoom,
-      agent: 'claude',
-      stance: 'critique',
-      message: 'Point 1 agree. Point 2 disagree: TTL should be 300s based on benchmark.',
-      timeout_sec: 10,
-    });
+    // Idempotent post-convergence "agreed" does not append duplicate message
+    const dupAgree = await send('antigravity', 'agreed', 'Redundant agreed after convergence');
+    check(dupAgree.status === 'converged' && dupAgree.sent_seq === 4, 'IdempotentAgree', dupAgree);
 
-    // Antigravity should immediately wake up with Claude's critique (#2)
-    const agyRecv1 = await agyExchange1Promise;
-    if (agyRecv1.status !== 'message_received' || agyRecv1.peer_message?.seq !== 2) {
-      throw new Error(`Unexpected agyRecv1: ${JSON.stringify(agyRecv1)}`);
-    }
-
-    // 5. Antigravity updates plan (#3) and waits for Claude
-    const agyExchange2Promise = handlePeerExchange({
-      room: testRoom,
-      agent: 'antigravity',
-      stance: 'critique',
-      message: 'Plan v2: Updated Point 2 to TTL 300s with invalidation hook.',
-      timeout_sec: 10,
-    });
-
-    // Claude wakes up with Plan v2 (#3)
-    const claudeRecv2 = await claudeExchange1Promise;
-    if (claudeRecv2.status !== 'message_received' || claudeRecv2.peer_message?.seq !== 3) {
-      throw new Error(`Unexpected claudeRecv2: ${JSON.stringify(claudeRecv2)}`);
-    }
-
-    // 6. Claude agrees 100% (stance: "agreed") -> both sides converge immediately!
-    const claudeAgree = await handlePeerExchange({
-      room: testRoom,
-      agent: 'claude',
-      stance: 'agreed',
-      message: '100% agreed with Plan v2. Zero further improvements.',
-      timeout_sec: 10,
-    });
-    const agyConverged = await agyExchange2Promise;
-
-    if (claudeAgree.status !== 'converged' || agyConverged.status !== 'converged') {
-      throw new Error(
-        `Convergence failed: claude=${claudeAgree.status}, agy=${agyConverged.status}`
-      );
-    }
-
-    // 7. Test unread inbox guard (user pauses Agent A while Agent B sends a message)
-    await handlePeerExchange({
-      room: testRoom,
-      agent: 'claude',
-      stance: 'critique',
-      message: 'Wait, user asked to also check memory cap (#5).',
+    // 3. Unread inbox guard (multi-message batch #5+#6 and converged/agreed #7) + unilateral agreed downgrade
+    await send('claude', 'critique', 'Extra check on memory cap (#5)', { wait_for_reply: false });
+    const selfAgreeDown = await send('claude', 'agreed', 'Unilateral self-agree (#6)', {
       wait_for_reply: false,
     });
+    check(
+      selfAgreeDown.status === 'sent' && selfAgreeDown.stance === 'critique' && Boolean(selfAgreeDown.note),
+      'UnilateralAgreeDowngrade',
+      selfAgreeDown
+    );
+    const guard1 = await send('antigravity', 'critique', 'Blind send', { wait_for_reply: false });
+    check(
+      guard1.status === 'unread_inbox_first' &&
+        guard1.peer_message?.seq === 6 &&
+        guard1.all_unread_delivered?.length === 2,
+      'Guard1',
+      guard1
+    );
 
-    // Antigravity tries to send without having read #5 first -> gets unread_inbox_first!
-    const unreadGuard = await handlePeerExchange({
-      room: testRoom,
-      agent: 'antigravity',
-      stance: 'critique',
-      message: 'My blind message before reading #5',
+    const send7 = await send('antigravity', 'agreed', 'Agreed on memory cap (#7)', { wait_for_reply: false });
+    check(send7.status === 'converged' && send7.sent_seq === 7, 'Send7', send7);
+
+    const guard2 = await send('claude', 'critique', 'Blind send before #7', { wait_for_reply: false });
+    check(
+      guard2.status === 'unread_inbox_first' &&
+        guard2.peer_message?.seq === 7 &&
+        handlePeerStatus({ room: testRoom, agent: 'claude' }).presence.claude.startsWith('idle'),
+      'Guard2',
+      guard2
+    );
+
+    // 4. Stale session (STALE_SESSION_MS) must NOT wipe unread messages when either sender or receiver calls handlePeerWait
+    const passiveWait = handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 10 });
+    await send('antigravity', 'propose', 'New topic plan (#1)', {
+      new_session: true,
       wait_for_reply: false,
     });
-    if (unreadGuard.status !== 'unread_inbox_first' || unreadGuard.peer_message?.seq !== 5) {
-      throw new Error(`Unread guard failed: ${JSON.stringify(unreadGuard)}`);
-    }
+    const passiveRecv = await passiveWait;
+    check(
+      passiveRecv.status === 'message_received' &&
+        passiveRecv.peer_message?.seq === 1 &&
+        passiveRecv.note === 'Peer started a new session.',
+      'PassiveWaitNewSession',
+      passiveRecv
+    );
 
-    // 8. Test heartbeat timeout when peer is running long measurements
-    const heartbeatRes = await handlePeerWait({
-      room: testRoom,
-      agent: 'antigravity',
-      timeout_sec: 1,
+    await send('antigravity', 'propose', 'Stale topic plan (#1)', {
+      new_session: true,
+      wait_for_reply: false,
     });
-    if (heartbeatRes.status !== 'waiting_heartbeat') {
-      throw new Error(`Heartbeat test failed: ${JSON.stringify(heartbeatRes)}`);
-    }
+    mutateRoomSync(testRoom, (s) => {
+      s.updatedMs -= STALE_SESSION_MS + 5000;
+      return {};
+    });
+    const senderStaleWait = await handlePeerWait({ room: testRoom, agent: 'antigravity', timeout_sec: 1 });
+    check(senderStaleWait.status === 'waiting_heartbeat' && senderStaleWait.sent_seq === 1, 'SenderStaleWait', senderStaleWait);
+    const staleRecv = await handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 2 });
+    check(staleRecv.status === 'message_received' && staleRecv.peer_message?.seq === 1, 'StaleUnread', staleRecv);
+    const wrongTurnWait = await handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 10 });
+    check(
+      wrongTurnWait.status === 'your_turn_to_reply' && wrongTurnWait.last_peer_seq === 1,
+      'WrongTurnGuard',
+      wrongTurnWait
+    );
+
+    // 5. Room reset while waiting in active session unlocks waiter with session_reset
+    await send('claude', 'critique', 'Waiting for reply (#2)', { wait_for_reply: false });
+    const waitResetP = handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 10 });
+    handlePeerStatus({ room: testRoom, action: 'reset' });
+    const resetWake = await waitResetP;
+    check(resetWake.status === 'session_reset', 'SessionResetWake', resetWake);
+
+    // 6. Cancellation safety (rpc_cancelled + superseded) + 1s heartbeat timeout + zero-write polling verification
+    const supersededP = handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 10 });
+    const cancelP = handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 10 }, 'req-99');
+    const supRes = await supersededP;
+    check(supRes.status === 'cancelled' && supRes.reason === 'superseded', 'Superseded', supRes);
+    cancelWaitByRequestId('req-99');
+    const cancelRes = await cancelP;
+    check(
+      cancelRes.status === 'cancelled' &&
+        cancelRes.reason === 'rpc_cancelled' &&
+        handlePeerStatus({ room: testRoom, agent: 'claude' }).presence.claude.startsWith('idle'),
+      'Cancel',
+      cancelRes
+    );
+
+    // First 1s wait transitions claude from idle -> waiting; second 1s wait must do 0 writes
+    const hb1 = await handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 1 });
+    check(hb1.status === 'waiting_heartbeat' && hb1.waited_sec === 1, 'Heartbeat1', hb1);
+    const mtimeBefore = fs.statSync(stateFile).mtimeMs;
+    const hb2 = await handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 1 });
+    const mutualWait = await handlePeerWait({ room: testRoom, agent: 'antigravity', timeout_sec: 10 });
+    const mtimeAfter = fs.statSync(stateFile).mtimeMs;
+    check(
+      hb2.status === 'waiting_heartbeat' &&
+        mutualWait.status === 'mutual_wait_prevented' &&
+        mtimeAfter === mtimeBefore,
+      'ZeroWriteAndMutualWaitGuard',
+      { mtimeBefore, mtimeAfter, mutualWait }
+    );
+
+    // 7. Corrupt JSON backup (moved once, not duplicated on subsequent status reads) & recovery
+    fs.writeFileSync(stateFile, '{corrupt json', 'utf-8');
+    const rec = handlePeerStatus({ room: testRoom, action: 'status' });
+    const corruptBackups = fs
+      .readdirSync(ARCHIVE_DIR)
+      .filter((f) => f.startsWith(`corrupt-${testRoom}-`));
+    check(
+      rec.status === 'ok' &&
+        rec.seq === 0 &&
+        corruptBackups.length === 1 &&
+        !fs.existsSync(stateFile),
+      'CorruptRecovery',
+      { rec, corruptBackups }
+    );
 
     console.log(
       JSON.stringify(
         {
           selftest: 'PASSED',
-          rounds_tested: 5,
           convergence_verified: true,
+          idempotent_agreed_verified: true,
           unread_inbox_guard_verified: true,
-          heartbeat_verified: true,
+          stale_unread_preservation_verified: true,
+          session_reset_wake_verified: true,
+          cancel_safety_verified: true,
+          no_op_wait_zero_writes_verified: true,
+          wrong_turn_and_mutual_wait_guards_verified: true,
+          corrupt_recovery_verified: true,
         },
         null,
         2
@@ -1158,6 +1509,14 @@ async function runSelfTest() {
   } finally {
     try {
       if (fs.existsSync(stateFile)) fs.unlinkSync(stateFile);
+      if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile);
+      if (fs.existsSync(ARCHIVE_DIR)) {
+        for (const f of fs.readdirSync(ARCHIVE_DIR)) {
+          if (f.startsWith(`${testRoom}-`) || f.startsWith(`corrupt-${testRoom}-`)) {
+            fs.unlinkSync(path.join(ARCHIVE_DIR, f));
+          }
+        }
+      }
     } catch {}
   }
 }
@@ -1169,15 +1528,18 @@ async function runCliMode() {
         'Usage: node server.cjs [options]',
         '',
         'MCP Stdio Mode (default):',
-        '  node server.cjs --agent antigravity',
-        '  node server.cjs --agent claude',
+        '  node server.cjs --agent antigravity [--room default]',
+        '  node server.cjs --agent claude [--room default]',
         '',
-        'CLI Helper / Diagnostics Mode:',
+        'CLI Diagnostics Mode:',
         '  node server.cjs --status [--room default]',
         '  node server.cjs --reset [--room default]',
-        '  node server.cjs --wait --agent <antigravity|claude> [--timeout 45]',
-        '  node server.cjs --send "<msg>" --agent <antigravity|claude> [--stance propose|critique|agreed] [--no-wait]',
         '  node server.cjs --selftest',
+        '  node server.cjs --help',
+        '',
+        'Environment Variables:',
+        '  AGENT_BRIDGE_DATA_DIR   Override room state directory (default: ./data)',
+        '  AGENT_BRIDGE_ROLE       Default agent identity (antigravity | claude)',
       ].join('\n')
     );
     return;
@@ -1188,46 +1550,25 @@ async function runCliMode() {
     return;
   }
 
-  if (cliOpts.cliMode === 'status') {
-    console.log(JSON.stringify(handlePeerStatus({ room: cliOpts.room, action: 'status' }), null, 2));
-    return;
-  }
-
-  if (cliOpts.cliMode === 'reset') {
-    console.log(JSON.stringify(handlePeerStatus({ room: cliOpts.room, action: 'reset' }), null, 2));
-    return;
-  }
-
-  if (cliOpts.cliMode === 'wait') {
-    const res = await handlePeerWait({
-      room: cliOpts.room,
-      agent: cliOpts.agent,
-      timeout_sec: cliOpts.timeoutSec,
-    });
-    console.log(JSON.stringify(res, null, 2));
-    return;
-  }
-
-  if (cliOpts.cliMode === 'send') {
-    const res = await handlePeerExchange({
-      room: cliOpts.room,
-      agent: cliOpts.agent,
-      message: cliOpts.message,
-      stance: cliOpts.stance,
-      topic: cliOpts.topic,
-      new_session: cliOpts.newSession,
-      wait_for_reply: cliOpts.waitForReply,
-      timeout_sec: cliOpts.timeoutSec,
-    });
-    console.log(JSON.stringify(res, null, 2));
+  if (cliOpts.cliMode === 'status' || cliOpts.cliMode === 'reset') {
+    console.log(
+      JSON.stringify(handlePeerStatus({ room: cliOpts.room, action: cliOpts.cliMode }), null, 2)
+    );
   }
 }
 
-if (cliOpts.cliMode) {
-  runCliMode().catch((err) => {
-    console.error(err instanceof Error ? err.message : String(err));
-    process.exit(1);
-  });
-} else {
-  startMcpStdioServer();
+module.exports = {
+  readJsonSafe,
+  writeJsonAtomic,
+};
+
+if (require.main === module) {
+  if (cliOpts.cliMode) {
+    runCliMode().catch((err) => {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    });
+  } else {
+    startMcpStdioServer();
+  }
 }

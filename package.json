@@ -7,6 +7,7 @@
     "start": "node server.cjs",
     "setup": "node setup.cjs",
     "check": "node setup.cjs --check",
+    "uninstall": "node setup.cjs --uninstall",
     "test": "node server.cjs --selftest",
     "status": "node server.cjs --status",
     "reset": "node server.cjs --reset"
